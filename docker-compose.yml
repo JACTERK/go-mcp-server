@@ -1,0 +1,10 @@
+services:
+  mcp-server:
+    build: .
+    container_name: mcp-server
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      - SUPABASE_DB_URL=${SUPABASE_DB_URL}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    restart: unless-stopped
