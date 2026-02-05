@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -85,6 +86,9 @@ func main() {
 		mcp.WithNumber("limit",
 			mcp.Description("The maximum number of documents to retrieve (default: 5)."),
 		),
+		mcp.WithNumber("neighbor_count",
+			mcp.Description("The number of neighboring chunks to include for context (default: 2)."),
+		),
 	)
 
 	// Add Tool Handler
@@ -98,6 +102,11 @@ func main() {
 		limit := request.GetInt("limit", 5)
 		if limit <= 0 {
 			limit = 5
+		}
+
+		neighborCount := request.GetInt("neighbor_count", 2)
+		if neighborCount < 0 {
+			neighborCount = 2
 		}
 
 		// Security: Retrieve Tenant ID from Context
@@ -118,37 +127,96 @@ func main() {
 		}
 		vector := embResp.Data[0].Embedding
 
-		// B. Query Supabase (pgvector)
-		// We use the <=> operator for Cosine Distance (standard for text similarity).
-		// We filter strictly by tenant_id to ensure isolation.
-		sql := `
-			SELECT content 
+		// B. Query Supabase (pgvector) - Step A: Vector Search (Index Small)
+		// Return metadata for Context Expansion and Deep Linking
+		sqlSearch := `
+			SELECT 
+				content,
+				metadata->>'notion_page_id' as page_id,
+				(metadata->>'chunk_index')::int as chunk_idx,
+				metadata->>'anchor_block_id' as block_id
 			FROM documents 
 			WHERE tenant_id = $1 
 			ORDER BY embedding <=> $2 
 			LIMIT $3`
 
-		// pgx can automatically encode the float32 slice into the vector type
-		rows, err := pool.Query(ctx, sql, tenantID, pgvector.NewVector(vector), limit)
+		// Struct to hold initial search results
+		type SearchResult struct {
+			Content  string
+			PageID   string
+			ChunkIdx int
+			BlockID  string
+		}
+
+		rows, err := pool.Query(ctx, sqlSearch, tenantID, pgvector.NewVector(vector), limit)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Database query failed: %v", err)), nil
 		}
 		defer rows.Close()
 
-		var results string
+		var hits []SearchResult
 		for rows.Next() {
-			var content string
-			if err := rows.Scan(&content); err != nil {
+			var h SearchResult
+			if err := rows.Scan(&h.Content, &h.PageID, &h.ChunkIdx, &h.BlockID); err != nil {
+				// Handle potential nulls or scan errors gracefully?
+				// For now just log/continue or fail. Logging is better.
+				log.Printf("Error scanning row: %v", err)
 				continue
 			}
-			results += fmt.Sprintf("---\n%s\n", content)
+			hits = append(hits, h)
 		}
+		rows.Close() // Close early to reuse connection or minimize overlap
 
-		if results == "" {
+		if len(hits) == 0 {
 			return mcp.NewToolResultText("No relevant documents found."), nil
 		}
 
-		return mcp.NewToolResultText(results), nil
+		// C. Context Expansion (Retrieve Big) & Deep Linking
+		var finalOutput strings.Builder
+
+		for _, hit := range hits {
+			// Step B: Context Expansion
+			// Fetch neighbors: [chunk_idx - neighborCount, chunk_idx + neighborCount]
+			// We order by chunk_index ASC to reconstruct the flow.
+			sqlContext := `
+				SELECT content 
+				FROM documents 
+				WHERE tenant_id = $1
+				  AND metadata->>'notion_page_id' = $2
+				  AND (metadata->>'chunk_index')::int BETWEEN $3 AND $4
+				ORDER BY (metadata->>'chunk_index')::int ASC`
+
+			startIdx := hit.ChunkIdx - neighborCount
+			endIdx := hit.ChunkIdx + neighborCount
+
+			rowsContext, err := pool.Query(ctx, sqlContext, tenantID, hit.PageID, startIdx, endIdx)
+			if err != nil {
+				log.Printf("Error fetching context for page %s: %v", hit.PageID, err)
+				// Fallback to just the matched content if context fetch fails
+				finalOutput.WriteString(fmt.Sprintf("---\n%s\n\n", hit.Content))
+				continue
+			}
+
+			var fullContext strings.Builder
+			for rowsContext.Next() {
+				var chunkText string
+				if err := rowsContext.Scan(&chunkText); err == nil {
+					fullContext.WriteString(chunkText)
+					fullContext.WriteString("\n")
+				}
+			}
+			rowsContext.Close()
+
+			// Step C: Deep Linking
+			// Format: https://notion.so/{page_id}#{block_id_without_hyphens}
+			cleanPageID := strings.ReplaceAll(hit.PageID, "-", "")
+			cleanBlockID := strings.ReplaceAll(hit.BlockID, "-", "")
+			deepLink := fmt.Sprintf("https://notion.so/%s#%s", cleanPageID, cleanBlockID)
+
+			finalOutput.WriteString(fmt.Sprintf("---\n%s\nSource: %s\n\n", fullContext.String(), deepLink))
+		}
+
+		return mcp.NewToolResultText(finalOutput.String()), nil
 	})
 
 	// Middleware to extract X-Tenant-ID and inject into Context

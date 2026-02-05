@@ -107,8 +107,11 @@ X-Tenant-ID: <uuid-of-tenant>
 #### `rag-search`
 Searches the knowledge base for relevant documents based on a semantic query.
 
--   **Input**: `query` (string) - The search term or question.
--   **Output**: A list of relevant document contents.
+-   **Input**:
+    -   `query` (string) - The search term or question.
+    -   `limit` (number, default: 5) - Maximum number of results.
+    -   `neighbor_count` (number, default: 2) - Number of neighboring chunks to fetch around each match (Context Expansion).
+-   **Output**: A formatted string containing relevant document segments, each followed by a **Source Deep Link** (`https://notion.so/...`) to the specific block in Notion.
 
 ## Development
 
@@ -118,6 +121,5 @@ Searches the knowledge base for relevant documents based on a semantic query.
 
 # TODO:
 
-- Pass metadata per document in the results, things like the title of the document, and the URL of the notion page (deep linking too)
-- Add tunable hyperparameters for the RAG search, things like the embedding model to use, the number of results to return, etc.
+- Add tunable hyperparameters for the RAG search (e.g., embedding model configuration).
 - Add authentication (either an API key or OAuth), Streamable HTTPS too. 
