@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -26,6 +28,9 @@ const (
 )
 
 func main() {
+	transport := flag.String("transport", "http", "Transport mode: 'http' or 'stdio'")
+	flag.Parse()
+
 	// Initialize Database Connection
 	dbURL := os.Getenv("SUPABASE_DB_URL")
 	if dbURL == "" {
@@ -86,8 +91,8 @@ func main() {
 		mcp.WithNumber("limit",
 			mcp.Description("The maximum number of documents to retrieve (default: 5)."),
 		),
-		mcp.WithNumber("neighbor_count",
-			mcp.Description("The number of neighboring chunks to include for context (default: 2)."),
+		mcp.WithString("tenant_id",
+			mcp.Description("The Tenant ID (UUID). Required if not provided via X-Tenant-ID header (e.g. in stdio mode)."),
 		),
 	)
 
@@ -104,19 +109,18 @@ func main() {
 			limit = 5
 		}
 
-		neighborCount := request.GetInt("neighbor_count", 2)
-		if neighborCount < 0 {
-			neighborCount = 2
-		}
-
-		// Security: Retrieve Tenant ID from Context
+		// Security: Retrieve Tenant ID from Context or Argument
 		tenantID, ok := ctx.Value(TenantIDKey).(string)
 		if !ok || tenantID == "" {
-			return mcp.NewToolResultError("Unauthorized: Missing X-Tenant-ID header"), nil
+			// Try getting it from arguments (for stdio)
+			tenantID = request.GetString("tenant_id", "")
+		}
+
+		if tenantID == "" {
+			return mcp.NewToolResultError("Unauthorized: Missing tenant_id. Must be provided via X-Tenant-ID header or 'tenant_id' argument."), nil
 		}
 
 		// A. Generate Embedding for the query
-		// We use text-embedding-3-small as a standard default. Ensure your DB vectors match this dimension (1536).
 		embReq := openai.EmbeddingRequest{
 			Input: []string{query},
 			Model: openai.SmallEmbedding3,
@@ -127,25 +131,22 @@ func main() {
 		}
 		vector := embResp.Data[0].Embedding
 
-		// B. Query Supabase (pgvector) - Step A: Vector Search (Index Small)
-		// Return metadata for Context Expansion and Deep Linking
+		// B. Vector Search — query child documents only
 		sqlSearch := `
-			SELECT 
-				content,
-				metadata->>'notion_page_id' as page_id,
-				(metadata->>'chunk_index')::int as chunk_idx,
-				metadata->>'anchor_block_id' as block_id
-			FROM documents 
-			WHERE tenant_id = $1 
-			ORDER BY embedding <=> $2 
+			SELECT id, content, metadata, parent_id,
+			       embedding <=> $2 AS distance
+			FROM documents
+			WHERE tenant_id = $1
+			  AND doc_type = 'child'
+			ORDER BY embedding <=> $2
 			LIMIT $3`
 
-		// Struct to hold initial search results
-		type SearchResult struct {
+		type ChildHit struct {
+			ID       string
 			Content  string
-			PageID   string
-			ChunkIdx int
-			BlockID  string
+			Metadata map[string]interface{}
+			ParentID string
+			Distance float64
 		}
 
 		rows, err := pool.Query(ctx, sqlSearch, tenantID, pgvector.NewVector(vector), limit)
@@ -154,66 +155,84 @@ func main() {
 		}
 		defer rows.Close()
 
-		var hits []SearchResult
+		var hits []ChildHit
 		for rows.Next() {
-			var h SearchResult
-			if err := rows.Scan(&h.Content, &h.PageID, &h.ChunkIdx, &h.BlockID); err != nil {
-				// Handle potential nulls or scan errors gracefully?
-				// For now just log/continue or fail. Logging is better.
-				log.Printf("Error scanning row: %v", err)
+			var h ChildHit
+			var metadataJSON []byte
+			if err := rows.Scan(&h.ID, &h.Content, &metadataJSON, &h.ParentID, &h.Distance); err != nil {
+				log.Printf("Error scanning child row: %v", err)
+				continue
+			}
+			// Parse JSONB metadata
+			if err := json.Unmarshal(metadataJSON, &h.Metadata); err != nil {
+				log.Printf("Error parsing metadata for child %s: %v", h.ID, err)
 				continue
 			}
 			hits = append(hits, h)
 		}
-		rows.Close() // Close early to reuse connection or minimize overlap
+		rows.Close()
 
 		if len(hits) == 0 {
 			return mcp.NewToolResultText("No relevant documents found."), nil
 		}
 
-		// C. Context Expansion (Retrieve Big) & Deep Linking
+		// C. Fetch parent documents (deduplicated)
+		type ParentDoc struct {
+			ID       string
+			Content  string
+			Metadata map[string]interface{}
+		}
+		parentCache := make(map[string]*ParentDoc)
+
+		sqlParent := `
+			SELECT id, content, metadata
+			FROM documents
+			WHERE id = $1`
+
+		for _, hit := range hits {
+			if _, exists := parentCache[hit.ParentID]; exists {
+				continue
+			}
+			var p ParentDoc
+			var metadataJSON []byte
+			err := pool.QueryRow(ctx, sqlParent, hit.ParentID).Scan(&p.ID, &p.Content, &metadataJSON)
+			if err != nil {
+				log.Printf("Error fetching parent %s: %v", hit.ParentID, err)
+				continue
+			}
+			if err := json.Unmarshal(metadataJSON, &p.Metadata); err != nil {
+				log.Printf("Error parsing parent metadata %s: %v", hit.ParentID, err)
+				continue
+			}
+			parentCache[hit.ParentID] = &p
+		}
+
+		// D. Build output — parent content for LLM context, child metadata for deep links
 		var finalOutput strings.Builder
 
 		for _, hit := range hits {
-			// Step B: Context Expansion
-			// Fetch neighbors: [chunk_idx - neighborCount, chunk_idx + neighborCount]
-			// We order by chunk_index ASC to reconstruct the flow.
-			sqlContext := `
-				SELECT content 
-				FROM documents 
-				WHERE tenant_id = $1
-				  AND metadata->>'notion_page_id' = $2
-				  AND (metadata->>'chunk_index')::int BETWEEN $3 AND $4
-				ORDER BY (metadata->>'chunk_index')::int ASC`
-
-			startIdx := hit.ChunkIdx - neighborCount
-			endIdx := hit.ChunkIdx + neighborCount
-
-			rowsContext, err := pool.Query(ctx, sqlContext, tenantID, hit.PageID, startIdx, endIdx)
-			if err != nil {
-				log.Printf("Error fetching context for page %s: %v", hit.PageID, err)
-				// Fallback to just the matched content if context fetch fails
+			parent, ok := parentCache[hit.ParentID]
+			if !ok {
+				// Fallback: use the child's own content if parent fetch failed
 				finalOutput.WriteString(fmt.Sprintf("---\n%s\n\n", hit.Content))
 				continue
 			}
 
-			var fullContext strings.Builder
-			for rowsContext.Next() {
-				var chunkText string
-				if err := rowsContext.Scan(&chunkText); err == nil {
-					fullContext.WriteString(chunkText)
-					fullContext.WriteString("\n")
-				}
+			// Deep link from child metadata
+			anchorBlockID, _ := hit.Metadata["anchor_block_id"].(string)
+			pageURL, _ := hit.Metadata["url"].(string)
+			title, _ := hit.Metadata["title"].(string)
+
+			deepLink := pageURL
+			if anchorBlockID != "" {
+				cleanBlockID := strings.ReplaceAll(anchorBlockID, "-", "")
+				// Build deep link: page URL base + #block anchor
+				notionPageID, _ := hit.Metadata["notion_page_id"].(string)
+				cleanPageID := strings.ReplaceAll(notionPageID, "-", "")
+				deepLink = fmt.Sprintf("https://notion.so/%s#%s", cleanPageID, cleanBlockID)
 			}
-			rowsContext.Close()
 
-			// Step C: Deep Linking
-			// Format: https://notion.so/{page_id}#{block_id_without_hyphens}
-			cleanPageID := strings.ReplaceAll(hit.PageID, "-", "")
-			cleanBlockID := strings.ReplaceAll(hit.BlockID, "-", "")
-			deepLink := fmt.Sprintf("https://notion.so/%s#%s", cleanPageID, cleanBlockID)
-
-			finalOutput.WriteString(fmt.Sprintf("---\n%s\nSource: %s\n\n", fullContext.String(), deepLink))
+			finalOutput.WriteString(fmt.Sprintf("---\nTitle: %s\n%s\nSource: %s\n\n", title, parent.Content, deepLink))
 		}
 
 		return mcp.NewToolResultText(finalOutput.String()), nil
@@ -260,6 +279,17 @@ func main() {
 
 			log.Printf("Completed %s request for %s in %v", r.Method, r.URL.Path, time.Since(start))
 		})
+	}
+
+	if *transport == "stdio" {
+		// Log to stderr in stdio mode to avoid corrupting JSON-RPC on stdout
+		log.SetOutput(os.Stderr)
+		fmt.Fprintln(os.Stderr, "MCP Server starting in stdio mode...")
+
+		if err := server.ServeStdio(s); err != nil {
+			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
+		}
+		return
 	}
 
 	// 7. Start HTTP Server
